@@ -34,7 +34,9 @@ from geth.utils.filesystem import (
     is_executable_available,
 )
 from geth.utils.networking import (
+    get_open_p2p_port,
     get_open_port,
+    is_p2p_port_open,
     is_port_open,
 )
 from geth.utils.validation import (
@@ -69,33 +71,54 @@ def construct_test_chain_kwargs(
     **overrides: Unpack[GethKwargsTypedDict],
 ) -> GethKwargsTypedDict:
     validate_geth_kwargs(overrides)
+    if sys.platform == "win32":
+        overrides.setdefault("ipc_disable", True)
+
+    allocated_ports = {
+        str(port)
+        for port in (
+            overrides.get("port"),
+            overrides.get("ws_port"),
+            overrides.get("rpc_port"),
+        )
+        if port is not None
+    }
+
+    def allocate_port(default: int, *, p2p: bool = False) -> str:
+        is_available = is_p2p_port_open if p2p else is_port_open
+        get_available = get_open_p2p_port if p2p else get_open_port
+        default_port = str(default)
+        if default_port not in allocated_ports and is_available(default):
+            port = default_port
+        else:
+            port = get_available()
+            while port in allocated_ports:
+                port = get_available()
+
+        allocated_ports.add(port)
+        return port
+
     overrides.setdefault("dev_mode", True)
     overrides.setdefault("password", DEFAULT_PASSWORD_PATH)
     overrides.setdefault("no_discover", True)
     overrides.setdefault("max_peers", "0")
     overrides.setdefault("network_id", "1234")
 
-    if is_port_open(30303):
-        overrides.setdefault("port", "30303")
-    else:
-        overrides.setdefault("port", get_open_port())
+    if "port" not in overrides:
+        overrides["port"] = allocate_port(30303, p2p=True)
 
     overrides.setdefault("ws_enabled", True)
     overrides.setdefault("ws_api", ALL_APIS)
 
-    if is_port_open(8546):
-        overrides.setdefault("ws_port", "8546")
-    else:
-        overrides.setdefault("ws_port", get_open_port())
+    if "ws_port" not in overrides:
+        overrides["ws_port"] = allocate_port(8546)
 
     overrides.setdefault("rpc_enabled", True)
     overrides.setdefault("rpc_api", ALL_APIS)
-    if is_port_open(8545):
-        overrides.setdefault("rpc_port", "8545")
-    else:
-        overrides.setdefault("rpc_port", get_open_port())
+    if "rpc_port" not in overrides:
+        overrides["rpc_port"] = allocate_port(8545)
 
-    if "ipc_path" not in overrides:
+    if not overrides.get("ipc_disable") and "ipc_path" not in overrides:
         # try to use a `geth.ipc` within the provided data_dir if the path is
         # short enough.
         if overrides.get("data_dir") is not None:
@@ -147,7 +170,9 @@ def construct_popen_command(**geth_kwargs: Unpack[GethKwargsTypedDict]) -> list[
 
     builder = CommandBuilder()
 
-    if gk.nice and is_nice_available():
+    # Git for Windows provides a nice.exe wrapper, but terminating that wrapper
+    # does not reliably terminate its geth child process.
+    if not sys.platform.startswith("win") and gk.nice and is_nice_available():
         builder.extend(("nice", "-n", "20"))
 
     builder.append(gk.geth_executable)
